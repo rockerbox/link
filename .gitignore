@@ -2,7 +2,10 @@
 *.pyc
 *.swp
 *.swo
+*.bak
 .coverage
 build
 build/*
 docs/_build
+dist/
+link.egg-info/

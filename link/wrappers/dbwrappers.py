@@ -1,13 +1,22 @@
+from contextlib import closing, contextmanager
+import six
+
 from link import Wrapper
 from link.utils import list_to_dataframe
-from contextlib import closing
-import defaults
+from . import defaults
+
+
+if six.PY3:
+    unicode = str
+    str = bytes
+
 
 MYSQL_CONNECTION_ERRORS = (2006, 2013)
 
+
 class DBCursorWrapper(Wrapper):
     """
-    Wraps a select and makes it easier to tranform the data
+    Wraps a select and makes it easier to transform the data
     """
     def __init__(self, cursor, query = None, wrap_name = None, args=None):
         self.cursor = cursor
@@ -109,6 +118,28 @@ class DBConnectionWrapper(Wrapper):
         cursor = self._wrapped.cursor()
         return self.CURSOR_WRAPPER(cursor, query, args=args)()
 
+    @contextmanager
+    def transaction(self):
+        """
+        Execute statement(s) within a transaction (BEGIN; .... ; COMMIT/ROLLBACK;). Rolls
+        back on any raised Exception.
+
+        Note that this will return a cursor for use during the transaction block.
+        However, the original connection can still be used to execute statements which
+        will all execute under the same transaction context. Note that this will NOT close
+        the connection.
+
+        Suggested usage:
+
+        conn = lnk.dbs.my_connection
+        with conn.transaction() as cursor:
+            cursor.execute("insert into foo values (...)")
+            print("Inserted {} rows".format(cursor.rowcount))
+            cursor.execute(" delete from foo where ...")
+            print("Deleted {} rows".format(cursor.rowcount))
+        """
+        raise NotImplementedError()
+
     #TODO: Add in the ability to pass in params and also index
     def select_dataframe(self, query, args=()):
         """
@@ -116,13 +147,14 @@ class DBConnectionWrapper(Wrapper):
         being the names of the colums in the dataframe
         """
         try:
-            from pandas import DataFrame
+            import pandas 
         except:
             raise Exception("pandas required to select dataframe. Please install"  +
                             "sudo easy_install pandas")
-
-        cursor = self.execute(query, args = args)
-        return cursor.as_dataframe()
+        
+        data = pandas.read_sql(query, self._wrapped, params = args)
+        data.rename({x: x.lower() for x in data.columns}, axis=1, inplace=True)
+        return data
 
     def select(self, query=None, chunk_name = None, args=()):
         """
@@ -374,7 +406,7 @@ class MysqlDB(DBConnectionWrapper):
         try:
             cursor = self._wrapped.cursor()
             return self.CURSOR_WRAPPER(cursor, query, args=args)()
-        except MySQLdb.OperationalError, e:
+        except MySQLdb.OperationalError as e:
             if e[0] in MYSQL_CONNECTION_ERRORS:
                 self._wrapped.close()
                 self._wrapped = self.create_connection()
@@ -431,7 +463,8 @@ class MysqlDB(DBConnectionWrapper):
 class PostgresDB(DBConnectionWrapper):
 
     def __init__(self, wrap_name=None, user=None, password=None,
-                 host=None, database=None, port=defaults.POSTGRES_DEFAULT_PORT):
+                 host=None, database=None, port=defaults.POSTGRES_DEFAULT_PORT,
+                 readonly=False, autocommit=False):
         """
         A connection for a Postgres Database.  Requires that
         psycopg2 is installed
@@ -446,6 +479,8 @@ class PostgresDB(DBConnectionWrapper):
         self.host = host
         self.database = database
         self.port = port
+        self.readonly = readonly
+        self.autocommit = autocommit
         super(PostgresDB, self).__init__(wrap_name=wrap_name)
 
     def create_connection(self):
@@ -466,6 +501,14 @@ class PostgresDB(DBConnectionWrapper):
 
         conn = psycopg2.connect(host=self.host, port=self.port,  user=self.user,
                                     password=self.password, database=self.database )
+
+        # If this is a read-only connection, then force autocommit as well
+        if self.readonly:
+            conn.set_session(autocommit=True, readonly=True)
+        # Else, set the autocommit
+        else:
+            conn.set_session(autocommit=self.autocommit)
+
         return conn
 
     def use(self, database):
@@ -483,9 +526,93 @@ class PostgresDB(DBConnectionWrapper):
 
     def __call__(self, query = None, outfile= None):
         """
-        Create a shell connection to this mysql instance
+        Create a shell connection to this postgresql instance
         """
         cmd = 'psql -U %s -W%s -h %s %s %s' % (self.user, self.password,
                                                      self.host, self.port, self.database)
         self.run_command(cmd)
 
+    @contextmanager
+    def transaction(self):
+        """
+        Execute statement(s) within a transaction (BEGIN; .... ; COMMIT/ROLLBACK;). Rolls
+        back on any raised Exception.
+
+        Note that this will return a psycopg2 cursor for use during the transaction block,
+        so that psycopg2 functionality such as copy_from() is still supported.
+        However, the original connection can still be used to execute statements which
+        will all execute under the same transaction context. Note that this will NOT close
+        the connection.
+
+        Suggested usage:
+
+        conn = lnk.dbs.my_connection
+        with conn.transaction() as cursor:
+            cursor.execute("insert into foo values (...)")
+            print("Inserted {} rows".format(cursor.rowcount))
+            cursor.execute(" delete from foo where ...")
+            print("Deleted {} rows".format(cursor.rowcount))
+        """
+        with self._wrapped as og_conn:
+            with og_conn.cursor() as cursor:
+                yield cursor
+
+
+class SnowflakeDB(DBConnectionWrapper):
+
+    def __init__(self, wrap_name=None, user=None, password=None, account_name=None,
+            database=None, schema=None, warehouse=None):
+        """
+        A connection to a Snowflake account. Requires snowflake-connector-python.
+
+        :param user: Username
+        :param password: Password
+        :param account_name: Snowflake account name
+        :param warehouse: Warehouse to use (Optional). If not passed in must be set
+            explicitly from connection.
+        :param database: Database to use (Optional). Requires setting a warehouse.
+        :param schema: Schema to use (Optional). Requires setting a database.
+        """
+        self.user = user
+        self.password = password
+        self.account_name = account_name
+        self.database = database
+        self.schema = schema
+        self.warehouse = warehouse
+        super(SnowflakeDB, self).__init__(wrap_name=wrap_name)
+
+    def create_connection(self):
+        import snowflake.connector as sf
+
+        conn = sf.connect(
+                user=self.user,
+                password=self.password,
+                account=self.account_name
+                )
+
+        if self.warehouse is not None:
+            conn.cursor().execute("USE warehouse {};".format(self.warehouse))
+
+            if self.database is not None:
+                db_str = "USE {}".format(self.database)
+                if self.schema is not None:
+                    db_str += ".{}".format(self.schema)
+
+                conn.cursor().execute(db_str)
+
+        return conn
+
+    @contextmanager
+    def transaction(self):
+        """
+        Executes a block within a transaction (BEGIN; .... ; COMMIT/ROLLBACK;). Rolls back
+        on any raised Exception. Note that this will NOT close the connection.
+        """
+        try:
+            cursor = self.cursor()
+            cursor.execute("BEGIN")
+            yield cursor
+            self.commit()
+        except:
+            self.rollback()
+            raise

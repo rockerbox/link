@@ -35,21 +35,35 @@ Sample Code::
 :license: Apache2, see LICENSE for more details.
 
 """
+from __future__ import print_function
+from __future__ import absolute_import
 
 import os
 import sys
 import inspect
 import json
-from utils import load_json_file
+import six
+
+if six.PY3:
+    unicode = str
+    str = bytes
+
+
 from subprocess import Popen
-from common import Cacheable
+
+from .utils import load_json_file
+from .common import Cacheable
+from .exceptions import LNKConfigException, LNKAttributeException
+from .s3_writer import S3Writer
+from . import _secrets
 
 # To set up logging manager
-from _logging_setup import LogHandler
+from ._logging_setup import LogHandler
 
 # this gets the current directory of link
 lnk_dir = os.path.split(os.path.abspath(__file__))[0]
 
+AWS_SECRETMANAGER_KEY = "aws_secret_manager_key"
 
 class Callable(object):
     """
@@ -70,7 +84,6 @@ class Callable(object):
         Right now it only supports string commands for the shell
         """
         cmd = command or self.command
-        # import pdb; pdb.set_trace()
 
         if cmd:
             p = Popen(cmd, shell=True)
@@ -115,7 +128,7 @@ class Commander(object):
         """
         Returns true if this commander has a command by this name
         """
-        return self.commands.has_key(name)
+        return name in self.commands
 
     def run_command(self, name="__default__", base_dir='', *kargs, **kwargs):
         """
@@ -140,7 +153,7 @@ class Commander(object):
                 p.wait()
                 return p
 
-        raise(Exception("No such command %s " % name))
+        raise Exception
 
     def command(self, name=None):
         """
@@ -161,11 +174,36 @@ class Link(object):
     """
     __link_instance = None
     __msg = None
+    __name__ = "lnk"
 
-    LNK_USER_DIR = '%s/.link' % os.getenv('HOME')
+    LNK_USER_DIR = '%s/.link' %  os.path.expanduser("~")
     LNK_DIR = os.getenv('LNK_DIR') or LNK_USER_DIR
     LNK_CONFIG = LNK_DIR + "/link.config"
     DEFAULT_CONFIG = {"dbs": {}, "apis": {}}
+
+    def __init__(self, config_file=None, namespace=None):
+        """
+        Create a new instance of the Link.  Should be done
+        through the instance() method.
+        """
+        # this will be lazy loaded
+        self.__config = None
+        self.wrappers = {}
+        self.fresh(config_file, namespace)
+
+    @classmethod
+    def instance(cls):
+        """
+        Gives you a singleton instance of the Link object
+        which shares your configuration across all other Linked
+        objects.  This is called called to create lnk and for the
+        most part should not be called again
+        """
+        if cls.__link_instance:
+            return cls.__link_instance
+
+        cls.__link_instance = Link()
+        return cls.__link_instance
 
     @classmethod
     def plugins_directory(cls):
@@ -211,30 +249,16 @@ class Link(object):
         # lets create the user config for them
         if "IPython" in sys.modules:
             if not os.path.exists(cls.LNK_DIR):
-                print "Creating user config dir %s " % cls.LNK_DIR
+                print("Creating user config dir %s " % cls.LNK_DIR)
                 os.makedirs(cls.LNK_DIR)
 
-            print "Creating default user config "
+            print("Creating default user config ")
             new_config = open(cls.LNK_CONFIG, 'w')
             new_config.write(json.dumps(cls.DEFAULT_CONFIG))
             new_config.close()
             return cls.LNK_CONFIG
 
         return None
-
-    @classmethod
-    def instance(cls):
-        """
-        Gives you a singleton instance of the Link object
-        which shares your configuration across all other Linked
-        objects.  This is called called to create lnk and for the
-        most part should not be called again
-        """
-        if cls.__link_instance:
-            return cls.__link_instance
-
-        cls.__link_instance = Link()
-        return cls.__link_instance
 
     def _get_all_wrappers(self, mod_or_package):
         """
@@ -304,7 +328,10 @@ class Link(object):
                         #.link/link.config file in your HOME directory""")
 
         if not self.__config:
-            self.__config = load_json_file(self.__config_file)
+            try:
+                self.__config = load_json_file(self.__config_file)
+            except:
+                raise LNKConfigException("Error parsing config")
 
         return self.__config
 
@@ -323,16 +350,6 @@ class Link(object):
         # self._commander = self.__config.get('__scripts__')
         self.namespace = namespace
         self.wrappers = {}
-
-    def __init__(self, config_file=None, namespace=None):
-        """
-        Create a new instance of the Link.  Should be done
-        through the instance() method.
-        """
-        # this will be lazy loaded
-        self.__config = None
-        self.wrappers = {}
-        self.fresh(config_file, namespace)
 
     def configure_msg(self, overrides={}, keep_existing=True, verbose=False):
         """
@@ -381,7 +398,7 @@ class Link(object):
         try:
             return self.__getattribute__(name)
         except Exception as e:
-            return self(wrap_name=name, **self._config[name].copy())
+            return self(wrap_name=name, **self.config(name).copy())
 
     def config(self, config_lookup=None):
         """
@@ -395,7 +412,7 @@ class Link(object):
                 for value in config_lookup.split('.'):
                     ret = ret[value]
             except KeyError:
-                raise KeyError('No such configured object %s' % config_lookup)
+                raise LNKAttributeException('No such configured object %s' % config_lookup)
             return ret
 
         return ret
@@ -408,6 +425,15 @@ class Link(object):
 
         if wrap_name:
             wrap_config = self.config(wrap_name)
+
+            #if they are using the aws secret manager, let's pull username nad
+            #password from there
+            if AWS_SECRETMANAGER_KEY in wrap_config:
+                secret = _secrets.get_secret(wrap_config[AWS_SECRETMANAGER_KEY])
+                wrap_config['user'] = secret.get('user', secret.get('username'))
+                wrap_config['password'] = secret.get('password', secret.get('pass'))
+                wrap_config.pop(AWS_SECRETMANAGER_KEY)
+
             # if its just a string, make a wrapper that is preloaded with
             # the string as the command.
             if isinstance(wrap_config, str) or isinstance(wrap_config, unicode):
@@ -452,11 +478,36 @@ class Link(object):
             cp_dir = self.plugins_directory()
 
         import shutil
-        print "installing %s into directory %s " % (file, cp_dir)
+        print("installing %s into directory %s " % (file, cp_dir))
         try:
             shutil.copy(file, cp_dir)
         except:
-            print "error moving files"
+            print("error moving files")
+
+    @classmethod
+    def upload_to_s3(cls, data, bucket_name, key_name,
+            aws_access_key_id=None, aws_secret_access_key=None,
+            df_column_names=False, gzip=False, gzip_compression_level=6):
+        """
+        Upload the given object to AWS S3.
+
+        Params:
+        * data (object) - object to upload
+        * bucket_name (str) - S3 bucket name
+        * key_name (str) - key name / "file path" in S3 to upload to
+        * aws_access_key_id (str) - Optional. AWS access key, if not using one of the
+            other locations to store/retrieve credentials
+        * aws_secret_access_key (str) - Optional. AWS secret, if not using one of the
+            other locations to store/retrieve credentials
+        * df_column_names (bool) - Optional. Whether or not to include the column names of
+            pandas DataFrame as the first row of the csv
+        * gzip (bool) - Optional. Whether or not to gzip the file
+        * gzip_compression_level (int) - Optional. Override gzip compression level
+        """
+        S3Writer.upload(data, bucket_name, key_name, aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key, gzip=gzip,
+                df_column_names=df_column_names,
+                gzip_compression_level=gzip_compression_level)
 
 
 lnk = Link.instance()
@@ -517,6 +568,9 @@ class Wrapper(Callable):
             return lnk(wrapper)
 
         raise AttributeError("No such attribute found %s" % name)
+
+    def __getitem__(self, name):
+        return self.__getattr__(name)
 
     def config(self):
         return self.__link_config__

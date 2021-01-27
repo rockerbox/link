@@ -28,7 +28,7 @@ class APIResponseWrapper(Wrapper):
         """
         if not self._json:
             try:
-                self._json = json.loads(self.content)
+                self._json = json.loads(self.content.decode("utf-8"))
             except:
                 raise ValueError("Response is not valid json %s " % self.content)
         return self._json
@@ -48,10 +48,10 @@ class APIResponseWrapper(Wrapper):
     @property
     def error(self):
         """
-        Returns the wrappers error by default but can be overridden 
+        Returns the wrappers error by default but can be overridden
         """
         return self._wrapped.error
- 
+
     def tostring(self):
         """
         If you have parsed json or xml it will
@@ -80,21 +80,24 @@ class APIRequestWrapper(Wrapper):
                         'User-Agent': 'Mozilla/5.0'
                       }
 
-    def __init__(self, wrap_name=None, base_url=None, user=None, password=None, 
+    def __init__(self, wrap_name=None, base_url=None, user=None, password=None,
                 response_wrapper = APIResponseWrapper ):
         self.base_url = base_url
         self.user = user
         self.password = password
-        self.response_wrapper = response_wrapper 
+        self.response_wrapper = response_wrapper
         sess = requests.session()
         sess.headers = self.headers
         super(APIRequestWrapper, self).__init__(wrap_name, sess)
         # Sets the Auth for the requests.session() object
         self.authenticate()
-    
+
+    def set_session_headers(self, name, value):
+        self._wrapped.headers[name]=value
+
     def authenticate(self):
         """
-        The authenicate function is called in the init of APIRequestWrapper.  
+        The authenicate function is called in the init of APIRequestWrapper.
         This can be overridden for customized Authentication.  By Default
         it will auth using HTTPBasicAuth
         """
@@ -124,7 +127,7 @@ class APIRequestWrapper(Wrapper):
             return self.request(method, url_params, data, allow_reauth=False, **kwargs)
 
         return resp
-    
+
     def get(self, url_params = '', **kwargs):
         """
         Make a get call
@@ -138,13 +141,20 @@ class APIRequestWrapper(Wrapper):
         return self.request('put', url_params = url_params, data = data,
                             **kwargs)
 
+    def patch(self, url_params='', data='', **kwargs):
+        """
+        Make a patch call
+        """
+        return self.request('patch', url_params = url_params, data = data,
+                            **kwargs)
+
     def post(self, url_params='', data='', **kwargs):
         """
         Make a post call
         """
         return self.request('post', url_params = url_params, data = data,
                             **kwargs)
-    
+
     def delete(self, url_params='', data='', **kwargs):
         """
         Make a delete call
@@ -174,15 +184,40 @@ class LnkClient(JsonClient):
     def __init__(self, wrap_name = None, host='localhost', port=5000, user = None, password=None):
         url = '%s:%s' % (host, port)
         super(LnkClient, self).__init__(wrap_name, base_url = url, user = user, password = password)
-    
+
     def configure(self):
         """
-        The api for requesting the configuration 
+        The api for requesting the configuration
         """
         post = {"user": self.user, 'password': self.password}
         return self.post('/configure', data = json.dumps(post))
-    
+
     def new(self):
         post = {"user": self.user, 'password': self.password}
         return self.post('/new', data = json.dumps(post))
+
+class OAuth1API(APIRequestWrapper):
+    """
+    Wrap the Console API
+    """
+    def __init__(self, wrap_name=None, base_url=None, app_key=None,
+                 app_secret=None, oauth_token=None, oauth_token_secret=None):
+        self.app_key = str(app_key)
+        self.app_secret = str(app_secret)
+        self.oauth_token = str(oauth_token)
+        self.oauth_token_secret = str(oauth_token_secret)
+
+        super(OAuth1API, self).__init__(wrap_name = wrap_name,
+                                                       base_url=base_url,
+                                                       response_wrapper = APIResponseWrapper)
+    def authenticate(self):
+        """
+        Write a custom auth property where we grab the auth token and put it in
+        the headers
+        """
+        from requests_oauthlib import OAuth1
+        auth = OAuth1(self.app_key, self.app_secret, self.oauth_token,
+                      self.oauth_token_secret)
+        return auth
+
 

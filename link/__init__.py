@@ -34,13 +34,15 @@ Sample Code::
 :license: Apache2, see LICENSE for more details.
 
 """
-#import all of this version information
-__version__ = '0.2.3'
-__author__ = 'David Himrod'
-__license__ = 'Apache 2.0'
-__copyright__ = 'Copyright 2013 David Himrod'
-__title__ = 'link'
+
+from __future__ import absolute_import
+
+import six
+
+if six.PY3:
+    unicode = str
+    str = bytes
 
 from .link import Link, Wrapper, lnk
 
-from common import *
+from .common import *
